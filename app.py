@@ -1,26 +1,32 @@
+# main.py
+import os
 import json
 import asyncio
+import logging
+from typing import Dict, List
+from collections import deque
 import numpy as np
-import wave
+from scipy.io.wavfile import write
 import struct
+import wave
 import io
 import base64
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from typing import List, Dict
-from scipy.io.wavfile import write
-import openai
 import httpx
-from deepgram import DeepgramClient, PrerecordedOptions, LiveTranscriptionEvents, LiveOptions
-import time
-import logging
+
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException
+from fastapi.responses import Response
+import uvicorn
+
+# AI Services
+import openai
+from deepgram import DeepgramClient, PrerecordedOptions, LiveOptions
+import requests
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI()
-
-# API Keys (Replace with your actual keys)
+# API Keys
 OPENAI_API_KEY = "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"
 DEEPGRAM_API_KEY = "b40137a84624ef9677285b9c9feb3d1f3e576417"
 LMNT_API_KEY = "e2b3ccd7d3ca4654a590309ac32320a5"
@@ -29,342 +35,410 @@ LMNT_API_KEY = "e2b3ccd7d3ca4654a590309ac32320a5"
 openai.api_key = OPENAI_API_KEY
 deepgram = DeepgramClient(DEEPGRAM_API_KEY)
 
-# Store active connections and their states
-active_connections: Dict[str, WebSocket] = {}
-connection_states: Dict[str, dict] = {}
+app = FastAPI(title="AI Telephonic System")
 
-class AICallHandler:
-    def __init__(self, connection_id: str, websocket: WebSocket):
-        self.connection_id = connection_id
-        self.websocket = websocket
-        self.audio_buffer = []
-        self.conversation_history = [
-            {"role": "system", "content": "You are a helpful AI assistant on a phone call. Keep responses concise and conversational, suitable for voice interaction. Be friendly and professional."}
-        ]
-        self.is_speaking = False
-        self.silence_start_time = None
-        self.min_silence_duration = 1.5  # seconds
-        
-    async def process_audio_chunk(self, audio_data):
-        """Process incoming audio chunk"""
-        try:
-            # Add to buffer
-            self.audio_buffer.extend(audio_data['samples'])
-            
-            # Check for silence detection (simple amplitude-based)
-            avg_amplitude = np.mean(np.abs(audio_data['samples']))
-            
-            if avg_amplitude < 100:  # Silence threshold
-                if self.silence_start_time is None:
-                    self.silence_start_time = time.time()
-                elif time.time() - self.silence_start_time > self.min_silence_duration:
-                    # Process accumulated audio
-                    await self.process_speech()
-                    self.silence_start_time = None
-            else:
-                self.silence_start_time = None
-                
-        except Exception as e:
-            logger.error(f"Error processing audio chunk: {e}")
+class AudioBuffer:
+    def __init__(self):
+        self.buffer = []
+        self.sample_rate = 8000
+        self.chunk_duration = 1.0  # seconds
+        self.samples_per_chunk = int(self.sample_rate * self.chunk_duration)
     
-    async def process_speech(self):
-        """Process accumulated speech and generate response"""
-        if not self.audio_buffer:
-            return
-            
-        try:
-            # Convert audio buffer to WAV format for Deepgram
-            audio_array = np.array(self.audio_buffer, dtype=np.int16)
-            
-            # Create WAV file in memory
-            wav_buffer = io.BytesIO()
-            with wave.open(wav_buffer, 'wb') as wav_file:
-                wav_file.setnchannels(1)  # Mono
-                wav_file.setsampwidth(2)  # 16-bit
-                wav_file.setframerate(8000)  # 8kHz
-                wav_file.writeframes(audio_array.tobytes())
-            
-            wav_buffer.seek(0)
-            audio_data = wav_buffer.read()
-            
-            # Clear buffer
-            self.audio_buffer = []
-            
-            # Transcribe with Deepgram
-            transcript = await self.transcribe_audio(audio_data)
-            
-            if transcript and transcript.strip():
-                logger.info(f"User said: {transcript}")
-                
-                # Generate AI response
-                ai_response = await self.generate_ai_response(transcript)
-                logger.info(f"AI response: {ai_response}")
-                
-                # Convert to speech and send
-                await self.text_to_speech_and_send(ai_response)
-                
-        except Exception as e:
-            logger.error(f"Error processing speech: {e}")
+    def add_samples(self, samples):
+        self.buffer.extend(samples)
     
-    async def transcribe_audio(self, audio_data: bytes) -> str:
-        """Transcribe audio using Deepgram"""
-        try:
-            options = PrerecordedOptions(
-                model="nova-2",
-                language="en-US",
-                smart_format=True,
-                punctuate=True,
-                diarize=False,
-            )
-            
-            response = deepgram.listen.prerecorded.v("1").transcribe_file(
-                {"buffer": audio_data, "mimetype": "audio/wav"}, options
-            )
-            
-            transcript = response["results"]["channels"][0]["alternatives"][0]["transcript"]
-            return transcript
-            
-        except Exception as e:
-            logger.error(f"Deepgram transcription error: {e}")
-            return ""
+    def get_chunk_if_ready(self):
+        if len(self.buffer) >= self.samples_per_chunk:
+            chunk = self.buffer[:self.samples_per_chunk]
+            self.buffer = self.buffer[self.samples_per_chunk:]
+            return chunk
+        return None
     
-    async def generate_ai_response(self, user_message: str) -> str:
-        """Generate AI response using OpenAI"""
+    def get_all_samples(self):
+        return self.buffer.copy()
+
+class ConversationManager:
+    def __init__(self):
+        self.conversation_history = []
+        self.system_prompt = """You are a helpful AI assistant for phone calls. 
+        Keep responses concise and natural for phone conversation. 
+        Ask clarifying questions when needed and be friendly and professional."""
+    
+    def add_message(self, role: str, content: str):
+        self.conversation_history.append({"role": role, "content": content})
+        # Keep only last 10 messages to manage context
+        if len(self.conversation_history) > 10:
+            self.conversation_history = self.conversation_history[-10:]
+    
+    async def get_ai_response(self, user_message: str) -> str:
         try:
-            self.conversation_history.append({"role": "user", "content": user_message})
+            self.add_message("user", user_message)
             
-            response = openai.ChatCompletion.create(
+            messages = [{"role": "system", "content": self.system_prompt}]
+            messages.extend(self.conversation_history)
+            
+            response = await openai.ChatCompletion.acreate(
                 model="gpt-3.5-turbo",
-                messages=self.conversation_history,
+                messages=messages,
                 max_tokens=150,
                 temperature=0.7
             )
             
-            ai_message = response.choices[0].message.content
-            self.conversation_history.append({"role": "assistant", "content": ai_message})
-            
-            return ai_message
+            ai_response = response.choices[0].message.content
+            self.add_message("assistant", ai_response)
+            return ai_response
             
         except Exception as e:
             logger.error(f"OpenAI API error: {e}")
-            return "I'm sorry, I didn't catch that. Could you please repeat?"
+            return "I'm sorry, I'm having trouble processing your request right now."
+
+class TTSManager:
+    def __init__(self):
+        self.lmnt_api_key = LMNT_API_KEY
+        self.voice_id = "lily"  # Default LMNT voice
     
-    async def text_to_speech_and_send(self, text: str):
-        """Convert text to speech using LMNT and send via WebSocket"""
+    async def text_to_speech(self, text: str) -> bytes:
         try:
-            # LMNT API call
-            async with httpx.AsyncClient() as client:
-                response = await client.post(
-                    "https://api.lmnt.com/v1/ai/speech",
-                    headers={
-                        "Authorization": f"Bearer {LMNT_API_KEY}",
-                        "Content-Type": "application/json"
-                    },
-                    json={
-                        "text": text,
-                        "voice": "lily",  # Choose appropriate voice
-                        "format": "wav",
-                        "sample_rate": 8000
-                    }
-                )
-                
-                if response.status_code == 200:
-                    audio_content = response.content
-                    await self.send_audio_to_caller(audio_content)
-                else:
-                    logger.error(f"LMNT API error: {response.status_code}")
-                    
-        except Exception as e:
-            logger.error(f"Text-to-speech error: {e}")
-    
-    async def send_audio_to_caller(self, audio_data: bytes):
-        """Send audio data back to caller via WebSocket"""
-        try:
-            # Parse WAV file
-            with wave.open(io.BytesIO(audio_data), 'rb') as wav_file:
-                frames = wav_file.readframes(wav_file.getnframes())
-                sample_rate = wav_file.getframerate()
-                
-            # Convert to int16 samples
-            samples = struct.unpack(f"<{len(frames)//2}h", frames)
+            url = "https://api.lmnt.com/v1/ai/speech"
+            headers = {
+                "Authorization": f"Bearer {self.lmnt_api_key}",
+                "Content-Type": "application/json"
+            }
             
-            # Send in chunks of 80 samples (10ms at 8kHz)
-            chunk_size = 80
-            for i in range(0, len(samples), chunk_size):
-                chunk = samples[i:i+chunk_size]
+            payload = {
+                "text": text,
+                "voice": self.voice_id,
+                "format": "wav",
+                "sample_rate": 8000
+            }
+            
+            async with httpx.AsyncClient() as client:
+                response = await client.post(url, headers=headers, json=payload)
                 
-                if len(chunk) == chunk_size:
-                    message = {
-                        "type": "media",
-                        "ucid": self.connection_id,
-                        "data": {
-                            "samples": list(chunk),
-                            "bitsPerSample": 16,
-                            "sampleRate": 8000,
-                            "channelCount": 1,
-                            "numberOfFrames": len(chunk),
-                            "type": "data"
-                        }
-                    }
+            if response.status_code == 200:
+                return response.content
+            else:
+                logger.error(f"LMNT API error: {response.status_code}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"TTS error: {e}")
+            return None
+    
+    def wav_to_samples(self, wav_data: bytes, target_sample_rate: int = 8000) -> List[int]:
+        try:
+            # Read WAV data
+            with io.BytesIO(wav_data) as wav_io:
+                with wave.open(wav_io, 'rb') as wf:
+                    frames = wf.readframes(wf.getnframes())
+                    sample_width = wf.getsampwidth()
+                    channels = wf.getnchannels()
                     
-                    await self.websocket.send_text(json.dumps(message))
-                    await asyncio.sleep(0.01)  # 10ms delay between chunks
+                    # Convert to samples
+                    if sample_width == 2:  # 16-bit
+                        samples = struct.unpack(f'<{len(frames)//2}h', frames)
+                    else:
+                        # Convert other formats to 16-bit
+                        samples = np.frombuffer(frames, dtype=np.int8)
+                        samples = (samples.astype(np.float32) / 128.0 * 32767).astype(np.int16)
+                    
+                    # Convert stereo to mono if needed
+                    if channels == 2:
+                        samples = samples[::2]  # Take every other sample
+                    
+                    return list(samples)
                     
         except Exception as e:
-            logger.error(f"Error sending audio: {e}")
+            logger.error(f"WAV conversion error: {e}")
+            return []
+
+class STTManager:
+    def __init__(self):
+        self.deepgram = deepgram
+    
+    async def speech_to_text(self, audio_samples: List[int], sample_rate: int = 8000) -> str:
+        try:
+            # Convert samples to WAV bytes
+            wav_data = self.samples_to_wav(audio_samples, sample_rate)
+            
+            options = PrerecordedOptions(
+                model="nova-2",
+                language="en",
+                smart_format=True,
+                punctuate=True
+            )
+            
+            response = await self.deepgram.listen.asyncprerecorded.v("1").transcribe_url(
+                {"buffer": wav_data, "mimetype": "audio/wav"},
+                options
+            )
+            
+            transcript = response.results.channels[0].alternatives[0].transcript
+            return transcript.strip()
+            
+        except Exception as e:
+            logger.error(f"STT error: {e}")
+            return ""
+    
+    def samples_to_wav(self, samples: List[int], sample_rate: int) -> bytes:
+        try:
+            # Convert samples to numpy array
+            audio_array = np.array(samples, dtype=np.int16)
+            
+            # Create WAV file in memory
+            wav_io = io.BytesIO()
+            with wave.open(wav_io, 'wb') as wf:
+                wf.setnchannels(1)  # Mono
+                wf.setsampwidth(2)  # 16-bit
+                wf.setframerate(sample_rate)
+                wf.writeframes(audio_array.tobytes())
+            
+            wav_io.seek(0)
+            return wav_io.read()
+            
+        except Exception as e:
+            logger.error(f"WAV creation error: {e}")
+            return b""
+
+# Global managers
+active_connections: Dict[str, WebSocket] = {}
+connection_managers: Dict[str, dict] = {}
+
+@app.get("/")
+async def root():
+    return {"message": "AI Telephonic System is running"}
+
+@app.route("/ozonetel", methods=['GET', 'POST'])
+async def handle_ozonetel_request(request: Request):
+    try:
+        # Get all query parameters
+        params = dict(request.query_params)
+        event = params.get('event', '')
+        
+        logger.info(f"Received event: {event}, params: {params}")
+        
+        if event == "NewCall":
+            # Convert all request args to a dictionary and convert to JSON string
+            uui_json = json.dumps(params)
+            
+            # Get the base URL from the request
+            base_url = str(request.base_url).rstrip('/')
+            websocket_url = base_url.replace('http', 'ws') + "/ws"
+            
+            # Return XML response to start streaming
+            xml_response = f'''<?xml version="1.0" encoding="UTF-8"?>
+<response>
+    <start-record/>
+    <stream is_sip="true" url="{websocket_url}" x-uui="{uui_json}">+918049250961</stream>
+</response>'''
+            
+            return Response(content=xml_response, media_type="application/xml")
+            
+        elif event == "Stream":
+            # Handle stream event
+            xml_response = '''<?xml version="1.0" encoding="UTF-8"?>
+<response>
+    <cctransfer record="" moh="default" uui="sales" timeout="30" ringType="ring">general</cctransfer>
+</response>'''
+            return Response(content=xml_response, media_type="application/xml")
+        
+        else:
+            # Default response
+            xml_response = '''<?xml version="1.0" encoding="UTF-8"?>
+<response>
+    <hangup/>
+</response>'''
+            return Response(content=xml_response, media_type="application/xml")
+            
+    except Exception as e:
+        logger.error(f"Error handling Ozonetel request: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    
     connection_id = str(id(websocket))
     active_connections[connection_id] = websocket
     
-    # Initialize AI call handler
-    ai_handler = AICallHandler(connection_id, websocket)
-    connection_states[connection_id] = {
-        "handler": ai_handler,
-        "start_time": time.time()
+    # Initialize managers for this connection
+    connection_managers[connection_id] = {
+        'audio_buffer': AudioBuffer(),
+        'conversation': ConversationManager(),
+        'tts': TTSManager(),
+        'stt': STTManager(),
+        'call_data': [],
+        'is_speaking': False,
+        'silence_counter': 0
     }
     
-    logger.info(f"New connection: {connection_id}")
+    logger.info(f"New WebSocket connection: {connection_id}")
     
-    # Send welcome message
-    welcome_message = "Hello! I'm your AI assistant. How can I help you today?"
-    await ai_handler.text_to_speech_and_send(welcome_message)
+    # Send initial greeting
+    await send_ai_response(connection_id, "Hello! How can I help you today?")
     
     try:
         while True:
+            # Receive message from client
             data = await websocket.receive_text()
             
             try:
                 json_data = json.loads(data)
+                await handle_websocket_message(connection_id, json_data)
                 
-                # Handle different message types
-                if json_data.get("event") == "start":
-                    logger.info(f"Call started for {connection_id}")
-                    
-                elif json_data.get("event") == "stop":
-                    logger.info(f"Call ended for {connection_id}")
-                    break
-                    
-                elif json_data.get("type") == "media":
-                    # Process audio data
-                    await ai_handler.process_audio_chunk(json_data["data"])
-                    
-                else:
-                    logger.info(f"Received: {json_data}")
-                    
             except json.JSONDecodeError:
                 logger.error(f"Invalid JSON received: {data}")
                 
     except WebSocketDisconnect:
-        logger.info(f"Client disconnected: {connection_id}")
+        logger.info(f"WebSocket disconnected: {connection_id}")
+        await cleanup_connection(connection_id)
+        
     except Exception as e:
         logger.error(f"WebSocket error: {e}")
-    finally:
+        await cleanup_connection(connection_id)
+
+async def handle_websocket_message(connection_id: str, message: dict):
+    managers = connection_managers[connection_id]
+    
+    if message.get("event") == "start":
+        logger.info(f"Call started for connection {connection_id}")
+        ucid = message.get("ucid")
+        did = message.get("did")
+        managers['ucid'] = ucid
+        managers['did'] = did
+        
+    elif message.get("event") == "stop":
+        logger.info(f"Call ended for connection {connection_id}")
+        await cleanup_connection(connection_id)
+        
+    elif message.get("event") == "media" and message.get("type") == "media":
+        # Handle audio data
+        data = message.get("data", {})
+        samples = data.get("samples", [])
+        
+        if samples:
+            managers['call_data'].append(message)
+            managers['audio_buffer'].add_samples(samples)
+            
+            # Check if we have enough audio for processing
+            chunk = managers['audio_buffer'].get_chunk_if_ready()
+            if chunk:
+                await process_audio_chunk(connection_id, chunk)
+
+async def process_audio_chunk(connection_id: str, audio_chunk: List[int]):
+    managers = connection_managers[connection_id]
+    
+    # Check if user is speaking (simple voice activity detection)
+    audio_level = np.mean(np.abs(audio_chunk))
+    
+    if audio_level > 100:  # Threshold for voice activity
+        managers['is_speaking'] = True
+        managers['silence_counter'] = 0
+    else:
+        managers['silence_counter'] += 1
+        
+        # If silence for 2 seconds (2 chunks), process speech
+        if managers['is_speaking'] and managers['silence_counter'] >= 2:
+            managers['is_speaking'] = False
+            
+            # Get all buffered audio for STT
+            all_samples = managers['audio_buffer'].get_all_samples()
+            if len(all_samples) > 8000:  # At least 1 second of audio
+                await process_speech(connection_id, all_samples)
+                managers['audio_buffer'] = AudioBuffer()  # Reset buffer
+
+async def process_speech(connection_id: str, audio_samples: List[int]):
+    managers = connection_managers[connection_id]
+    
+    try:
+        # Convert speech to text
+        transcript = await managers['stt'].speech_to_text(audio_samples)
+        
+        if transcript:
+            logger.info(f"User said: {transcript}")
+            
+            # Get AI response
+            ai_response = await managers['conversation'].get_ai_response(transcript)
+            logger.info(f"AI response: {ai_response}")
+            
+            # Send AI response as speech
+            await send_ai_response(connection_id, ai_response)
+            
+    except Exception as e:
+        logger.error(f"Error processing speech: {e}")
+
+async def send_ai_response(connection_id: str, text: str):
+    managers = connection_managers[connection_id]
+    websocket = active_connections.get(connection_id)
+    
+    if not websocket:
+        return
+    
+    try:
+        # Convert text to speech
+        wav_data = await managers['tts'].text_to_speech(text)
+        
+        if wav_data:
+            # Convert WAV to samples
+            samples = managers['tts'].wav_to_samples(wav_data)
+            
+            # Send audio in chunks of 80 samples (10ms at 8kHz)
+            chunk_size = 80
+            ucid = managers.get('ucid', 'unknown')
+            
+            for i in range(0, len(samples), chunk_size):
+                chunk = samples[i:i + chunk_size]
+                
+                # Pad last chunk if needed
+                if len(chunk) < chunk_size:
+                    chunk.extend([0] * (chunk_size - len(chunk)))
+                
+                # Create WebSocket message
+                message = {
+                    "event": "media",
+                    "type": "media",  
+                    "ucid": ucid,
+                    "data": {
+                        "samples": chunk,
+                        "bitsPerSample": 16,
+                        "sampleRate": 8000,
+                        "channelCount": 1,
+                        "numberOfFrames": len(chunk),
+                        "type": "data"
+                    }
+                }
+                
+                await websocket.send_text(json.dumps(message))
+                await asyncio.sleep(0.01)  # 10ms delay between chunks
+                
+    except Exception as e:
+        logger.error(f"Error sending AI response: {e}")
+
+async def cleanup_connection(connection_id: str):
+    try:
+        # Save call recording
+        if connection_id in connection_managers:
+            call_data = connection_managers[connection_id]['call_data']
+            if call_data:
+                audio_samples = []
+                for data in call_data:
+                    samples = data.get("data", {}).get("samples", [])
+                    audio_samples.extend(samples)
+                
+                if audio_samples:
+                    audio_array = np.array(audio_samples, dtype=np.int16)
+                    os.makedirs("recordings", exist_ok=True)
+                    write(f"recordings/{connection_id}.wav", 8000, audio_array)
+                    logger.info(f"Saved recording: recordings/{connection_id}.wav")
+        
         # Cleanup
         if connection_id in active_connections:
             del active_connections[connection_id]
-        if connection_id in connection_states:
-            del connection_states[connection_id]
-        logger.info(f"Connection {connection_id} cleaned up")
-
-# Health check endpoint
-@app.get("/health")
-async def health_check():
-    return {"status": "healthy", "active_connections": len(active_connections)}
-
-# Test endpoint to check API keys
-@app.get("/test-apis")
-async def test_apis():
-    results = {}
-    
-    # Test OpenAI
-    try:
-        response = openai.ChatCompletion.create(
-            model="gpt-3.5-turbo",
-            messages=[{"role": "user", "content": "Say hello"}],
-            max_tokens=10
-        )
-        results["openai"] = "✓ Working"
+        if connection_id in connection_managers:
+            del connection_managers[connection_id]
+            
     except Exception as e:
-        results["openai"] = f"✗ Error: {str(e)}"
-    
-    # Test Deepgram (basic connection test)
-    try:
-        # This is a simple connection test
-        dg_client = DeepgramClient(DEEPGRAM_API_KEY)
-        results["deepgram"] = "✓ Client initialized"
-    except Exception as e:
-        results["deepgram"] = f"✗ Error: {str(e)}"
-    
-    # Test LMNT
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.get(
-                "https://api.lmnt.com/v1/ai/voices",
-                headers={"Authorization": f"Bearer {LMNT_API_KEY}"}
-            )
-            if response.status_code == 200:
-                results["lmnt"] = "✓ Working"
-            else:
-                results["lmnt"] = f"✗ HTTP {response.status_code}"
-    except Exception as e:
-        results["lmnt"] = f"✗ Error: {str(e)}"
-    
-    return results
+        logger.error(f"Error during cleanup: {e}")
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8080)
-
-from fastapi import FastAPI, Request
-import json
-
-# Add this to your main app.py or create a separate route handler
-
-@app.route('/ivr', methods=['GET', 'POST'])
-async def handle_ivr_request(request: Request):
-    """Handle incoming IVR requests and return appropriate XML responses"""
-    
-    # Get request parameters
-    event = request.query_params.get('event', '')
-    did = request.query_params.get('did', '')
-    caller_id = request.query_params.get('cid', '')
-    
-    print(f"IVR Event: {event}, DID: {did}, Caller ID: {caller_id}")
-    
-    if event == "NewCall":
-        # Convert all request params to dictionary for UUI
-        all_params = dict(request.query_params)
-        uui_json = json.dumps(all_params)
-        
-        # Return XML to start WebSocket stream
-        # Replace YOUR_WEBSOCKET_URL with your actual WebSocket server URL
-        return f'''<?xml version="1.0" encoding="UTF-8"?>
-<response>
-    <start-record/>
-    <stream is_sip="true" url="wss://kookoo-9xgc.onrender.com/ws" x-uui="{uui_json}">{did}</stream>
-</response>'''
-    
-    elif event == "Stream":
-        # Handle stream events if needed
-        return '''<?xml version="1.0" encoding="UTF-8"?>
-<response>
-    <hangup/>
-</response>'''
-    
-    elif event == "Hangup":
-        # Handle call hangup
-        return '''<?xml version="1.0" encoding="UTF-8"?>
-<response>
-    <hangup/>
-</response>'''
-    
-    else:
-        # Default response
-        return '''<?xml version="1.0" encoding="UTF-8"?>
-<response>
-    <hangup/>
-</response>'''
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
