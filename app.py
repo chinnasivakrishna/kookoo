@@ -345,7 +345,7 @@ async def handle_ivr_request(request: Request):
         return f'''<?xml version="1.0" encoding="UTF-8"?>
 <response>
     <start-record/>
-    <stream is_sip="true" url="ws://YOUR_SERVER_IP:8080/ws" x-uui="{uui_json}">{did}</stream>
+    <stream is_sip="true" url="wss://kookoo-9xgc.onrender.com/ws" x-uui="{uui_json}">{did}</stream>
 </response>'''
     
     elif event == "Stream":
